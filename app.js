@@ -48,8 +48,38 @@ const uniformBuffer = device.createBuffer({
 
 device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
 
+/*
+ * Storage Buffer: stores the states of buffer
+ */ 
+// Create an array representing the active state of each cell.
+const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE);
 
+// Create a storage buffer to hold the cell state.
+// Create two storage buffers to hold the cell state.
+const cellStateStorage = [
+    device.createBuffer({
+      label: "Cell State A",
+      size: cellStateArray.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    }),
+    device.createBuffer({
+      label: "Cell State B",
+       size: cellStateArray.byteLength,
+       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+  ];
 
+// Mark every third cell of the first grid as active.
+for (let i = 0; i < cellStateArray.length; i+=3) {
+    cellStateArray[i] = 1;
+  }
+  device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+  
+  // Mark every other cell of the second grid as active.
+  for (let i = 0; i < cellStateArray.length; i++) {
+    cellStateArray[i] = i % 2;
+  }
+  device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
 /*
  * Define the cell vertices 
  */
@@ -90,23 +120,37 @@ const vertexBufferLayout = {
 const cellShaderModule = device.createShaderModule({
     label: 'Cell shader',
     code: `
-      @group(0) @binding(0) var<uniform> grid: vec2f;
+      struct VertexInput {
+        @location(0) pos: vec2f,
+        @builtin(instance_index) instance: u32,
+      };
 
+      struct VertexOutput {
+        @builtin(position) pos: vec4f,
+        @location(0) cell: vec2f,
+      };
+      
+      @group(0) @binding(0) var<uniform> grid: vec2f;
+      @group(0) @binding(1) var<storage> cellState: array<u32>; 
       @vertex
-      fn vertexMain(@location(0) pos: vec2f,
-                    @builtin(instance_index) instance: u32) ->
-        @builtin(position) vec4f {
-        let i = f32(instance); 
+      fn vertexMain(input: VertexInput) -> VertexOutput {
+        let i = f32(input.instance); 
         let cell = vec2(i%grid.x, floor(i/grid.x));
         let cellOffset = cell / grid * 2;
+        let state = f32(cellState[input.instance]);
 
-        let gridPos = (pos+1)/grid - 1 + cellOffset;
-        return vec4f(gridPos, 0, 1);
+        let gridPos = (input.pos*state+1)/grid - 1 + cellOffset;
+        
+        var output: VertexOutput;
+        output.pos = vec4f(gridPos, 0, 1);
+        output.cell = cell;
+        return output;
       }
   
       @fragment
-      fn fragmentMain() -> @location(0) vec4f {
-        return vec4f(1, 0, 0, 1);
+      fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+        let c = input.cell/grid;
+        return vec4f(c, 1-c.x, 1);
       }
     `
   });
@@ -129,31 +173,57 @@ const cellPipeline = device.createRenderPipeline({
     },
 })
 
-const bindGroup = device.createBindGroup({
-    label: "Cell renderer bind group",
-    layout: cellPipeline.getBindGroupLayout(0), 
-    entries: [{
-        binding: 0, 
-        resource: {buffer : uniformBuffer}
-    }]
-})
+const bindGroups = [
+    device.createBindGroup({
+      label: "Cell renderer bind group A",
+      layout: cellPipeline.getBindGroupLayout(0),
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: cellStateStorage[0] }
+      }],
+    }),
+     device.createBindGroup({
+      label: "Cell renderer bind group B",
+      layout: cellPipeline.getBindGroupLayout(0),
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: cellStateStorage[1] }
+      }],
+    })
+  ];
 
+const UPDATE_INTERVAL = 200; // Update every 200ms (5 times/sec)
+let step = 0; // Track how many simulation steps have been run
 /* Drawing calls */
-const encoder = device.createCommandEncoder();
-const pass = encoder.beginRenderPass({
-    colorAttachments: [{
+function updateGrid() {
+    step++; // Increment the step count
+    
+    // Start a render pass 
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
         view: context.getCurrentTexture().createView(),
         loadOp: "clear",
-        clearValue: { r:0 , g:0 , b: 0.4, a: 1},
-        storeOp: "store"
-    }]
-});
+        clearValue: { r: 0, g: 0, b: 0.4, a: 1.0 },
+        storeOp: "store",
+      }]
+    });
+  
+    // Draw the grid.
+    pass.setPipeline(cellPipeline);
+    pass.setBindGroup(0, bindGroups[step % 2]); // Updated!
+    pass.setVertexBuffer(0, vertexBuffer);
+    pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
+  
+    // End the render pass and submit the command buffer
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
 
-pass.setPipeline(cellPipeline);
-pass.setVertexBuffer(0, vertexBuffer);
-pass.setBindGroup(0, bindGroup); 
-pass.draw(vertices.length / 2, GRID_SIZE*GRID_SIZE); // 6 vertices
-
-pass.end();
-
-device.queue.submit([encoder.finish()]);
+setInterval(updateGrid, UPDATE_INTERVAL);
